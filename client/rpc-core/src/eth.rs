@@ -202,10 +202,6 @@ pub trait EthApi {
 		number_or_hash: Option<BlockNumberOrHash>,
 	) -> RpcResult<U256>;
 
-	/// Returns all pending transactions.
-	#[method(name = "eth_pendingTransactions")]
-	async fn pending_transactions(&self) -> RpcResult<Vec<Transaction>>;
-
 	// ########################################################################
 	// Fee
 	// ########################################################################
