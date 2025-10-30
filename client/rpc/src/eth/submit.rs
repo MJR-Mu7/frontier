@@ -34,7 +34,7 @@ use fp_rpc::{ConvertTransaction, ConvertTransactionRuntimeApi, EthereumRuntimeRP
 
 use crate::{
 	eth::{format, Eth},
-	internal_err,
+	internal_err, 
 };
 
 impl<B, C, P, CT, BE, A, CIDP, EC> Eth<B, C, P, CT, BE, A, CIDP, EC>
@@ -49,6 +49,7 @@ where
 	A: ChainApi<Block = B>,
 	CIDP: CreateInherentDataProviders<B, ()> + Send + 'static,
 {
+	/// Submits a new Ethereum transaction.
 	pub async fn send_transaction(&self, request: TransactionRequest) -> RpcResult<H256> {
 		let from = match request.from {
 			Some(from) => from,
@@ -154,14 +155,15 @@ where
 			.map_err(|err| internal_err(format::Geth::pool_error(err)))
 			.await
 	}
-
+	
+	/// Submits a raw Ethereum transaction.
 	pub async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<H256> {
 		let bytes = bytes.into_vec();
 		if bytes.is_empty() {
 			return Err(internal_err("transaction data is empty"));
 		}
 
-		let transaction: ethereum::TransactionV2 =
+		let transaction: ethereum::TransactionV3 =
 			match ethereum::EnvelopedDecodable::decode(&bytes) {
 				Ok(transaction) => transaction,
 				Err(_) => return Err(internal_err("decode transaction failed")),
@@ -178,10 +180,11 @@ where
 			.await
 	}
 
+	/// Convert an Ethereum transaction into a Substrate extrinsic.
 	fn convert_transaction(
 		&self,
 		block_hash: B::Hash,
-		transaction: ethereum::TransactionV2,
+		transaction: ethereum::TransactionV3,
 	) -> RpcResult<B::Extrinsic> {
 		let api_version = match self
 			.client
@@ -202,7 +205,7 @@ where
 				Err(_) => Err(internal_err("cannot access `ConvertTransactionRuntimeApi`")),
 			},
 			Some(1) => {
-				if let ethereum::TransactionV2::Legacy(legacy_transaction) = transaction {
+				if let ethereum::TransactionV3::Legacy(legacy_transaction) = transaction {
 					// To be compatible with runtimes that do not support transactions v2
 					#[allow(deprecated)]
 					match self
