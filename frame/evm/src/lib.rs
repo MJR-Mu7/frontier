@@ -67,8 +67,9 @@ pub mod runner;
 mod tests;
 pub mod weights;
 
-use alloc::{collections::btree_map::BTreeMap, vec::Vec};
+use alloc::{borrow::Cow, collections::btree_map::BTreeMap, vec::Vec};
 use core::cmp::min;
+use ethereum::AuthorizationList;
 pub use evm::{
 	Config as EvmConfig, Context, ExitError, ExitFatal, ExitReason, ExitRevert, ExitSucceed,
 };
@@ -147,6 +148,14 @@ pub mod pallet {
 		#[pallet::no_default_bounds]
 		type CallOrigin: EnsureAddressOrigin<Self::RuntimeOrigin>;
 
+		/// Allow the source address to deploy contracts directly via CREATE calls.
+		#[pallet::no_default_bounds]
+		type CreateOriginFilter: EnsureCreateOrigin<Self>;
+
+		/// Allow the source address to deploy contracts via CALL(CREATE) calls.
+		#[pallet::no_default_bounds]
+		type CreateInnerOriginFilter: EnsureCreateOrigin<Self>;
+
 		/// Allow the origin to withdraw on behalf of given address.
 		#[pallet::no_default_bounds]
 		type WithdrawOrigin: EnsureAddressOrigin<Self::RuntimeOrigin, Success = AccountIdOf<Self>>;
@@ -158,10 +167,6 @@ pub mod pallet {
 		/// Currency type for withdraw and balance storage.
 		#[pallet::no_default]
 		type Currency: Currency<AccountIdOf<Self>> + Inspect<AccountIdOf<Self>>;
-
-		/// The overarching event type.
-		#[pallet::no_default_bounds]
-		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
 		/// Precompiles associated with this EVM engine.
 		type PrecompilesType: PrecompileSet;
@@ -204,7 +209,7 @@ pub mod pallet {
 
 		/// EVM config used in the module.
 		fn config() -> &'static EvmConfig {
-			&CANCUN_CONFIG
+			&PECTRA_CONFIG
 		}
 	}
 
@@ -243,8 +248,6 @@ pub mod pallet {
 			type FeeCalculator = FixedGasPrice;
 			type GasWeightMapping = FixedGasWeightMapping<Self>;
 			type WeightPerGas = WeightPerGas;
-			#[inject_runtime_type]
-			type RuntimeEvent = ();
 			type PrecompilesType = ();
 			type PrecompilesValue = ();
 			type ChainId = ChainId;
@@ -254,6 +257,8 @@ pub mod pallet {
 			type FindAuthor = FindAuthorTruncated;
 			type GasLimitPovSizeRatio = GasLimitPovSizeRatio;
 			type GasLimitStorageGrowthRatio = GasLimitStorageGrowthRatio;
+			type CreateOriginFilter = ();
+			type CreateInnerOriginFilter = ();
 			type WeightInfo = ();
 		}
 
@@ -321,6 +326,7 @@ pub mod pallet {
 			max_priority_fee_per_gas: Option<U256>,
 			nonce: Option<U256>,
 			access_list: Vec<(H160, Vec<H256>)>,
+			authorization_list: AuthorizationList,
 		) -> DispatchResultWithPostInfo {
 			T::CallOrigin::ensure_address_origin(&source, origin)?;
 
@@ -336,6 +342,7 @@ pub mod pallet {
 				max_priority_fee_per_gas,
 				nonce,
 				access_list,
+				authorization_list,
 				is_transactional,
 				validate,
 				None,
@@ -397,6 +404,7 @@ pub mod pallet {
 			max_priority_fee_per_gas: Option<U256>,
 			nonce: Option<U256>,
 			access_list: Vec<(H160, Vec<H256>)>,
+			authorization_list: AuthorizationList,
 		) -> DispatchResultWithPostInfo {
 			T::CallOrigin::ensure_address_origin(&source, origin)?;
 
@@ -411,6 +419,7 @@ pub mod pallet {
 				max_priority_fee_per_gas,
 				nonce,
 				access_list,
+				authorization_list,
 				is_transactional,
 				validate,
 				None,
@@ -484,6 +493,7 @@ pub mod pallet {
 			max_priority_fee_per_gas: Option<U256>,
 			nonce: Option<U256>,
 			access_list: Vec<(H160, Vec<H256>)>,
+			authorization_list: AuthorizationList,
 		) -> DispatchResultWithPostInfo {
 			T::CallOrigin::ensure_address_origin(&source, origin)?;
 
@@ -499,6 +509,7 @@ pub mod pallet {
 				max_priority_fee_per_gas,
 				nonce,
 				access_list,
+				authorization_list,
 				is_transactional,
 				validate,
 				None,
@@ -599,6 +610,8 @@ pub mod pallet {
 		TransactionMustComeFromEOA,
 		/// Undefined error.
 		Undefined,
+		/// Address not allowed to deploy contracts either via CREATE or CALL(CREATE).
+		CreateOriginNotAllowed,
 	}
 
 	impl<T> From<TransactionValidationError> for Error<T> {
@@ -614,6 +627,8 @@ pub mod pallet {
 				TransactionValidationError::InvalidFeeInput => Error::<T>::GasPriceTooLow,
 				TransactionValidationError::InvalidChainId => Error::<T>::InvalidChainId,
 				TransactionValidationError::InvalidSignature => Error::<T>::InvalidSignature,
+				TransactionValidationError::EmptyAuthorizationList => Error::<T>::Undefined,
+				TransactionValidationError::AuthorizationListTooLarge => Error::<T>::Undefined,
 				TransactionValidationError::UnknownError => Error::<T>::Undefined,
 			}
 		}
@@ -652,7 +667,7 @@ pub mod pallet {
 					account.balance.unique_saturated_into(),
 				);
 
-				Pallet::<T>::create_account(*address, account.code.clone());
+				let _ = Pallet::<T>::create_account(*address, account.code.clone(), None);
 
 				for (index, value) in &account.storage {
 					<AccountStorages<T>>::insert(address, index, value);
@@ -699,7 +714,7 @@ pub struct CodeMetadata {
 }
 
 impl CodeMetadata {
-	fn from_code(code: &[u8]) -> Self {
+	pub fn from_code(code: &[u8]) -> Self {
 		let size = code.len() as u64;
 		let hash = H256::from(sp_io::hashing::keccak_256(code));
 
@@ -810,6 +825,30 @@ where
 	}
 }
 
+pub trait EnsureCreateOrigin<T> {
+	fn check_create_origin(address: &H160) -> Result<(), Error<T>>;
+}
+
+pub struct EnsureAllowedCreateAddress<AddressGetter>(core::marker::PhantomData<AddressGetter>);
+
+impl<AddressGetter, T: Config> EnsureCreateOrigin<T> for EnsureAllowedCreateAddress<AddressGetter>
+where
+	AddressGetter: Get<Vec<H160>>,
+{
+	fn check_create_origin(address: &H160) -> Result<(), Error<T>> {
+		if !AddressGetter::get().contains(address) {
+			return Err(Error::<T>::CreateOriginNotAllowed);
+		}
+		Ok(())
+	}
+}
+
+impl<T> EnsureCreateOrigin<T> for () {
+	fn check_create_origin(_address: &H160) -> Result<(), Error<T>> {
+		Ok(())
+	}
+}
+
 /// Trait to be implemented for evm address mapping.
 pub trait AddressMapping<A> {
 	fn into_account_id(address: H160) -> A;
@@ -898,7 +937,7 @@ where
 	}
 }
 
-static CANCUN_CONFIG: EvmConfig = EvmConfig::cancun();
+static PECTRA_CONFIG: EvmConfig = EvmConfig::pectra();
 
 impl<T: Config> Pallet<T> {
 	/// Check whether an account is empty.
@@ -922,10 +961,8 @@ impl<T: Config> Pallet<T> {
 
 	/// Remove an account.
 	pub fn remove_account(address: &H160) {
-		if <AccountCodes<T>>::contains_key(address) {
-			let account_id = T::AddressMapping::into_account_id(*address);
-			T::AccountProvider::remove_account(&account_id);
-		}
+		let account_id = T::AddressMapping::into_account_id(*address);
+		T::AccountProvider::remove_account(&account_id);
 
 		<AccountCodes<T>>::remove(address);
 		<AccountCodesMetadata<T>>::remove(address);
@@ -933,9 +970,20 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Create an account.
-	pub fn create_account(address: H160, code: Vec<u8>) {
+	pub fn create_account(
+		address: H160,
+		code: Vec<u8>,
+		caller: Option<H160>,
+	) -> Result<(), ExitError> {
+		if let Some(caller_address) = caller {
+			T::CreateInnerOriginFilter::check_create_origin(&caller_address).map_err(|e| {
+				let error: &'static str = e.into();
+				ExitError::Other(Cow::Borrowed(error))
+			})?;
+		}
+
 		if code.is_empty() {
-			return;
+			return Ok(());
 		}
 
 		if !<AccountCodes<T>>::contains_key(address) {
@@ -948,6 +996,7 @@ impl<T: Config> Pallet<T> {
 		<AccountCodesMetadata<T>>::insert(address, meta);
 
 		<AccountCodes<T>>::insert(address, code);
+		Ok(())
 	}
 
 	/// Get the account metadata (hash and size) from storage if it exists,
