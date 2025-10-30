@@ -684,6 +684,7 @@ where
 					gas,
 					value,
 					data,
+					nonce,
 					access_list,
 					authorization_list,
 					..
@@ -707,7 +708,7 @@ where
 								value.unwrap_or_default(),
 								gas_limit,
 								gas_price,
-								None,
+								nonce,
 								estimate_mode,
 							)
 							.map_err(|err| internal_err(format!("runtime error: {err}")))?
@@ -726,7 +727,7 @@ where
 								gas_limit,
 								max_fee_per_gas,
 								max_priority_fee_per_gas,
-								None,
+								nonce,
 								estimate_mode,
 							)
 							.map_err(|err| internal_err(format!("runtime error: {err}")))?
@@ -746,7 +747,7 @@ where
 								gas_limit,
 								max_fee_per_gas,
 								max_priority_fee_per_gas,
-								None,
+								nonce,
 								estimate_mode,
 								Some(
 									access_list
@@ -769,7 +770,7 @@ where
 								&gas_limit,
 								&max_fee_per_gas,
 								&max_priority_fee_per_gas,
-								&None::<Option<U256>>,
+								&nonce,
 								&estimate_mode,
 								&Some(
 									access_list
@@ -842,7 +843,7 @@ where
 								&gas_limit,
 								&max_fee_per_gas,
 								&max_priority_fee_per_gas,
-								&None::<Option<U256>>,
+								&nonce,
 								&estimate_mode,
 								&Some(
 									access_list
@@ -898,7 +899,7 @@ where
 								value.unwrap_or_default(),
 								gas_limit,
 								gas_price,
-								None,
+								nonce,
 								estimate_mode,
 							)
 							.map_err(|err| internal_err(format!("runtime error: {err}")))?
@@ -916,7 +917,7 @@ where
 								gas_limit,
 								max_fee_per_gas,
 								max_priority_fee_per_gas,
-								None,
+								nonce,
 								estimate_mode,
 							)
 							.map_err(|err| internal_err(format!("runtime error: {err}")))?
@@ -935,7 +936,7 @@ where
 								gas_limit,
 								max_fee_per_gas,
 								max_priority_fee_per_gas,
-								None,
+								nonce,
 								estimate_mode,
 								Some(
 									access_list
@@ -957,7 +958,7 @@ where
 								&gas_limit,
 								&max_fee_per_gas,
 								&max_priority_fee_per_gas,
-								&None::<Option<U256>>,
+								&nonce,
 								&estimate_mode,
 								&Some(
 									access_list
@@ -1029,7 +1030,7 @@ where
 								&gas_limit,
 								&max_fee_per_gas,
 								&max_priority_fee_per_gas,
-								&None::<Option<U256>>,
+								&nonce,
 								&estimate_mode,
 								&Some(
 									access_list
