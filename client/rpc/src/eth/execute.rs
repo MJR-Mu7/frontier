@@ -106,7 +106,7 @@ where
 			)
 		};
 
-		let (substrate_hash, api) = match frontier_backend_client::native_block_id::<B, C>(
+		let (substrate_hash, mut api) = match frontier_backend_client::native_block_id::<B, C>(
 			self.client.as_ref(),
 			self.backend.as_ref(),
 			number_or_hash,
@@ -878,28 +878,7 @@ where
 											raw: r
 										},
 									)
-								}
-							} else {
-							// Post-london + access list support
-							let access_list = access_list.unwrap_or_default();
-							let info = api.call(
-								substrate_hash,
-								from.unwrap_or_default(),
-								to,
-								data,
-								value.unwrap_or_default(),
-								gas_limit,
-								max_fee_per_gas,
-								max_priority_fee_per_gas,
-								None,
-								estimate_mode,
-								Some(
-									access_list
-										.into_iter()
-										.map(|item| (item.address, item.storage_keys))
-										.collect(),
-								),							
-							)
+								})
 								.map_err(|err| internal_err(format!("runtime error: {err}")))?
 								.map_err(|err| internal_err(format!("execution fatal: {err:?}")))?;
 
@@ -1092,30 +1071,8 @@ where
 
 							(info.exit_reason, Vec::new(), info.used_gas.effective)
 						} else {
-							// Post-london + access list support
-							let access_list = access_list.unwrap_or_default();
-							let info = api.create(
-								substrate_hash,
-								from.unwrap_or_default(),
-								data,
-								value.unwrap_or_default(),
-								gas_limit,
-								max_fee_per_gas,
-								max_priority_fee_per_gas,
-								None,
-								estimate_mode,
-								Some(
-									access_list
-										.into_iter()
-										.map(|item| (item.address, item.storage_keys))
-										.collect(),
-								),
-							)
-							.map_err(|err| internal_err(format!("runtime error: {err}")))?
-							.map_err(|err| internal_err(format!("execution fatal: {err:?}")))?;
-
-							(info.exit_reason, Vec::new(), info.used_gas.effective)
-						}				
+							return Err(internal_err(format!("Unsupported EthereumRuntimeRPCApi version: {}", api_version)));
+						}
 					}
 				};
 				Ok(ExecutableResult {

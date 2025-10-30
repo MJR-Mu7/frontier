@@ -125,7 +125,7 @@ impl EthSigner for EthDevSigner {
 								input: m.input.clone(),
 								access_list: m.access_list,
 								signature: eip2930::TransactionSignature::new(
-									odd_y_parity: recid.serialize() != 0,
+									recid.serialize() != 0,
 									r,
 									s,
 								)
@@ -151,7 +151,7 @@ impl EthSigner for EthDevSigner {
 								input: m.input.clone(),
 								access_list: m.access_list,
 								signature: eip2930::TransactionSignature::new(
-									odd_y_parity: recid.serialize() != 0,
+									recid.serialize() != 0,
 									r,
 									s,
 								)
@@ -178,7 +178,7 @@ impl EthSigner for EthDevSigner {
 								access_list: m.access_list,
 								authorization_list: m.authorization_list,
 								signature: eip2930::TransactionSignature::new(
-									odd_y_parity: recid.serialize() != 0,
+									recid.serialize() != 0,
 									r,
 									s,
 								)

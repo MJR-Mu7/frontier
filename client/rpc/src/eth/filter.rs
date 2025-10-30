@@ -46,7 +46,7 @@ use crate::{cache::EthBlockDataCacheTask, frontier_backend_client, internal_err}
 pub struct EthFilter<B: BlockT, C, BE, A: ChainApi> {
 	client: Arc<C>,
 	backend: Arc<dyn fc_api::Backend<B>>,
-	graph: Arc<Pool<A>>,
+	graph: Arc<Pool<A, ()>>,
 	filter_pool: FilterPool,
 	max_stored_filters: usize,
 	max_past_logs: u32,
@@ -58,7 +58,7 @@ impl<B: BlockT, C, BE, A: ChainApi> EthFilter<B, C, BE, A> {
 	pub fn new(
 		client: Arc<C>,
 		backend: Arc<dyn fc_api::Backend<B>>,
-		graph: Arc<Pool<A>>,
+		graph: Arc<Pool<A, ()>>,
 		filter_pool: FilterPool,
 		max_stored_filters: usize,
 		max_past_logs: u32,
