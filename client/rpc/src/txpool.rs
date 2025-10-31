@@ -45,7 +45,7 @@ struct TxPoolTransactions {
 
 pub struct TxPool<B, C, A: ChainApi> {
 	client: Arc<C>,
-	graph: Arc<Pool<A>>,
+	graph: Arc<Pool<A, ()>>,
 	_marker: PhantomData<B>,
 }
 
@@ -137,7 +137,7 @@ where
 }
 
 impl<B, C, A: ChainApi> TxPool<B, C, A> {
-	pub fn new(client: Arc<C>, graph: Arc<Pool<A>>) -> Self {
+	pub fn new(client: Arc<C>, graph: Arc<Pool<A, ()>>) -> Self {
 		Self {
 			client,
 			graph,
