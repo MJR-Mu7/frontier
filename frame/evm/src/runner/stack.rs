@@ -45,7 +45,7 @@ use sp_runtime::traits::UniqueSaturatedInto;
 // Frontier
 use fp_evm::{
 	AccessedStorage, CallInfo, CreateInfo, ExecutionInfoV2, IsPrecompileResult, Log, PrecompileSet,
-	Vicinity, WeightInfo, ACCOUNT_BASIC_PROOF_SIZE, ACCOUNT_CODES_KEY_SIZE,
+	StateOverride, Vicinity, WeightInfo, ACCOUNT_BASIC_PROOF_SIZE, ACCOUNT_CODES_KEY_SIZE,
 	ACCOUNT_CODES_METADATA_PROOF_SIZE, ACCOUNT_STORAGE_PROOF_SIZE, IS_EMPTY_CHECK_PROOF_SIZE,
 	WRITE_PROOF_SIZE,
 };
@@ -83,6 +83,7 @@ where
 		weight_limit: Option<Weight>,
 		proof_size_base_cost: Option<u64>,
 		measured_proof_size_before: u64,
+		state_override: StateOverride,
 		f: F,
 	) -> Result<ExecutionInfoV2<R>, RunnerError<Error<T>>>
 	where
@@ -114,6 +115,7 @@ where
 			weight_limit,
 			proof_size_base_cost,
 			measured_proof_size_before,
+			state_override,
 		);
 
 		#[cfg(feature = "forbid-evm-reentrancy")]
@@ -153,6 +155,7 @@ where
 				weight_limit,
 				proof_size_base_cost,
 				measured_proof_size_before,
+				state_override,
 			)
 		});
 
@@ -175,6 +178,7 @@ where
 		weight_limit: Option<Weight>,
 		proof_size_base_cost: Option<u64>,
 		measured_proof_size_before: u64,
+		state_override: StateOverride,
 	) -> Result<ExecutionInfoV2<R>, RunnerError<Error<T>>>
 	where
 		F: FnOnce(
@@ -189,12 +193,21 @@ where
 	{
 		// Used to record the external costs in the evm through the StackState implementation
 		let maybe_weight_info =
-			WeightInfo::new_from_weight_limit(weight_limit, proof_size_base_cost).map_err(
-				|_| RunnerError {
-					error: Error::<T>::GasLimitTooLow,
-					weight,
-				},
-			)?;
+			match WeightInfo::new_from_weight_limit(weight_limit, proof_size_base_cost) {
+				Ok(weight_info) => weight_info,
+				Err(_) => {
+					return Ok(ExecutionInfoV2 {
+						exit_reason: ExitError::OutOfGas.into(),
+						value: Default::default(),
+						used_gas: fp_evm::UsedGas {
+							standard: gas_limit.into(),
+							effective: gas_limit.into(),
+						},
+						weight_info: None,
+						logs: Default::default(),
+					})
+				}
+			};
 		// The precompile check is only used for transactional invocations. However, here we always
 		// execute the check, because the check has side effects.
 		match precompiles.is_precompile(source, gas_limit) {
@@ -221,11 +234,25 @@ where
 		//
 		// EIP-3607: https://eips.ethereum.org/EIPS/eip-3607
 		// Do not allow transactions for which `tx.sender` has any code deployed.
-		if is_transactional && !<AccountCodes<T>>::get(source).is_empty() {
-			return Err(RunnerError {
-				error: Error::<T>::TransactionMustComeFromEOA,
-				weight,
-			});
+		// Exception: Allow transactions from EOAs whose code is a valid delegation indicator (0xef0100 || address).
+		if is_transactional {
+			// Check if the account has code deployed
+			if let Some(metadata) = <AccountCodesMetadata<T>>::get(source) {
+				if metadata.size > 0 {
+					// Account has code, check if it's a valid delegation
+					let is_delegation = metadata.size
+						== evm::delegation::EIP_7702_DELEGATION_SIZE as u64
+						&& <AccountCodes<T>>::get(source)
+							.starts_with(evm::delegation::EIP_7702_DELEGATION_PREFIX);
+
+					if !is_delegation {
+						return Err(RunnerError {
+							error: Error::<T>::TransactionMustComeFromEOA,
+							weight,
+						});
+					}
+				}
+			}
 		}
 
 		let total_fee_per_gas = if is_transactional {
@@ -284,12 +311,19 @@ where
 		};
 
 		let metadata = StackSubstateMetadata::new(gas_limit, config);
-		let state = SubstrateStackState::new(&vicinity, metadata, maybe_weight_info, storage_limit);
+		let state = SubstrateStackState::new(
+			&vicinity,
+			metadata,
+			maybe_weight_info,
+			storage_limit,
+			state_override,
+		);
 		let mut executor = StackExecutor::new_with_precompiles(state, config, precompiles);
 
 		// Execute the EVM call.
-		let (reason, retv, used_gas, effective_gas) =
-			fp_evm::handle_storage_oog::<R, _>(gas_limit, || {
+		let (reason, retv, used_gas, effective_gas) = fp_evm::handle_storage_oog::<R, _>(
+			gas_limit,
+			|| {
 				let (reason, retv) = f(&mut executor);
 
 				// Compute the storage gas cost based on the storage growth.
@@ -316,9 +350,7 @@ where
 
 					log::trace!(
 						target: "evm",
-						"Proof size computation: (estimated: {}, actual: {})",
-						estimated_proof_size,
-						actual_proof_size
+						"Proof size computation: (estimated: {estimated_proof_size}, actual: {actual_proof_size})"
 					);
 
 					// If the proof_size calculated from the host-function gives an higher cost than
@@ -329,10 +361,8 @@ where
 					if actual_proof_size > estimated_proof_size {
 						log::debug!(
 							target: "evm",
-							"Proof size underestimation detected! (estimated: {}, actual: {}, diff: {})",
-							estimated_proof_size,
-							actual_proof_size,
-							actual_proof_size.saturating_sub(estimated_proof_size),
+							"Proof size underestimation detected! (estimated: {estimated_proof_size}, actual: {actual_proof_size}, diff: {})",
+							actual_proof_size.saturating_sub(estimated_proof_size)
 						);
 						estimated_proof_size
 					} else {
@@ -349,32 +379,19 @@ where
 
 				log::debug!(
 					target: "evm",
-					"Calculating effective gas: max(used: {}, pov: {}, storage: {}) = {}",
-					used_gas,
-					pov_gas,
-					storage_gas,
-					effective_gas
+					"Calculating effective gas: max(used: {used_gas}, pov: {pov_gas}, storage: {storage_gas}) = {effective_gas}"
 				);
 
 				(reason, retv, used_gas, U256::from(effective_gas))
-			});
+			},
+		);
 
 		let actual_fee = effective_gas.saturating_mul(total_fee_per_gas);
 		let actual_base_fee = effective_gas.saturating_mul(base_fee);
 
 		log::debug!(
 			target: "evm",
-			"Execution {:?} [source: {:?}, value: {}, gas_limit: {}, actual_fee: {}, used_gas: {}, effective_gas: {}, base_fee: {}, total_fee_per_gas: {}, is_transactional: {}]",
-			reason,
-			source,
-			value,
-			gas_limit,
-			actual_fee,
-			used_gas,
-			effective_gas,
-			base_fee,
-			total_fee_per_gas,
-			is_transactional
+			"Execution {reason:?} [source: {source:?}, value: {value}, gas_limit: {gas_limit}, actual_fee: {actual_fee}, used_gas: {used_gas}, effective_gas: {effective_gas}, base_fee: {base_fee}, total_fee_per_gas: {total_fee_per_gas}, is_transactional: {is_transactional}]"
 		);
 		// The difference between initially withdrawn and the actual cost is refunded.
 		//
@@ -413,8 +430,7 @@ where
 		for address in &state.substate.deletes {
 			log::debug!(
 				target: "evm",
-				"Deleting account at {:?}",
-				address
+				"Deleting account at {address:?}"
 			);
 			Pallet::<T>::remove_account(address)
 		}
@@ -481,9 +497,11 @@ where
 			fp_evm::CheckEvmTransactionConfig {
 				evm_config,
 				block_gas_limit: T::BlockGasLimit::get(),
+				transaction_gas_limit: T::TransactionGasLimit::get(),
 				base_fee,
 				chain_id: T::ChainId::get(),
 				is_transactional,
+				allow_unprotected_txs: true,
 			},
 			fp_evm::CheckEvmTransactionInput {
 				chain_id: Some(T::ChainId::get()),
@@ -523,6 +541,7 @@ where
 		validate: bool,
 		weight_limit: Option<Weight>,
 		proof_size_base_cost: Option<u64>,
+		state_override: StateOverride,
 		config: &evm::Config,
 	) -> Result<CallInfo, RunnerError<Self::Error>> {
 		let measured_proof_size_before = get_proof_size().unwrap_or_default();
@@ -571,6 +590,7 @@ where
 			weight_limit,
 			proof_size_base_cost,
 			measured_proof_size_before,
+			state_override,
 			|executor| {
 				executor.transact_call(
 					source,
@@ -651,6 +671,7 @@ where
 			weight_limit,
 			proof_size_base_cost,
 			measured_proof_size_before,
+			None,
 			|executor| {
 				let address = executor.create_address(evm::CreateScheme::Legacy { caller: source });
 				T::OnCreate::on_create(source, address);
@@ -735,6 +756,7 @@ where
 			weight_limit,
 			proof_size_base_cost,
 			measured_proof_size_before,
+			None,
 			|executor| {
 				let address = executor.create_address(evm::CreateScheme::Create2 {
 					caller: source,
@@ -752,6 +774,89 @@ where
 					authorization_list,
 				);
 				(reason, address)
+			},
+		)
+	}
+
+	fn create_force_address(
+		source: H160,
+		init: Vec<u8>,
+		value: U256,
+		gas_limit: u64,
+		max_fee_per_gas: Option<U256>,
+		max_priority_fee_per_gas: Option<U256>,
+		nonce: Option<U256>,
+		access_list: Vec<(H160, Vec<H256>)>,
+		authorization_list: AuthorizationList,
+		is_transactional: bool,
+		validate: bool,
+		weight_limit: Option<Weight>,
+		proof_size_base_cost: Option<u64>,
+		config: &evm::Config,
+		contract_address: H160,
+	) -> Result<CreateInfo, RunnerError<Self::Error>> {
+		let measured_proof_size_before = get_proof_size().unwrap_or_default();
+		let (_, weight) = T::FeeCalculator::min_gas_price();
+
+		T::CreateOriginFilter::check_create_origin(&source)
+			.map_err(|error| RunnerError { error, weight })?;
+
+		let authorization_list = authorization_list
+			.iter()
+			.map(|d| {
+				(
+					U256::from(d.chain_id),
+					d.address,
+					d.nonce,
+					d.authorizing_address().ok(),
+				)
+			})
+			.collect::<Vec<(U256, sp_core::H160, U256, Option<sp_core::H160>)>>();
+
+		if validate {
+			Self::validate(
+				source,
+				None,
+				init.clone(),
+				value,
+				gas_limit,
+				max_fee_per_gas,
+				max_priority_fee_per_gas,
+				nonce,
+				access_list.clone(),
+				authorization_list.clone(),
+				is_transactional,
+				weight_limit,
+				proof_size_base_cost,
+				config,
+			)?;
+		}
+		let precompiles = T::PrecompilesValue::get();
+		Self::execute(
+			source,
+			value,
+			gas_limit,
+			max_fee_per_gas,
+			max_priority_fee_per_gas,
+			config,
+			&precompiles,
+			is_transactional,
+			weight_limit,
+			proof_size_base_cost,
+			measured_proof_size_before,
+			None,
+			|executor| {
+				T::OnCreate::on_create(source, contract_address);
+				let (reason, _) = executor.transact_create_force_address(
+					source,
+					value,
+					init,
+					gas_limit,
+					access_list,
+					authorization_list,
+					contract_address,
+				);
+				(reason, contract_address)
 			},
 		)
 	}
@@ -884,6 +989,16 @@ pub struct SubstrateStackState<'vicinity, 'config, T> {
 	substate: SubstrateStackSubstate<'config>,
 	original_storage: BTreeMap<(H160, H256), H256>,
 	transient_storage: BTreeMap<(H160, H256), H256>,
+	/// Per-account full storage replacement. When an address is present here, storage
+	/// reads are served exclusively from the per-address map (missing slots return zero)
+	/// instead of the on-chain trie. An entry with an empty inner map represents a full
+	/// wipe (Geth-style `"state": {}`).
+	state_override: BTreeMap<H160, BTreeMap<H256, H256>>,
+	/// Per-frame snapshots of `state_override`, pushed on `enter` and restored
+	/// on `exit_revert`/`exit_discard` (Geth StateDB snapshot parity).
+	/// `None` entries skip the clone when the override map is empty — safe
+	/// because `state_override` only shrinks during execution.
+	state_override_journal: Vec<Option<BTreeMap<H160, BTreeMap<H256, H256>>>>,
 	recorded: Recorded,
 	weight_info: Option<WeightInfo>,
 	storage_meter: Option<StorageMeter>,
@@ -897,8 +1012,17 @@ impl<'vicinity, 'config, T: Config> SubstrateStackState<'vicinity, 'config, T> {
 		metadata: StackSubstateMetadata<'config>,
 		weight_info: Option<WeightInfo>,
 		storage_limit: Option<u64>,
+		state_override: StateOverride,
 	) -> Self {
 		let storage_meter = storage_limit.map(StorageMeter::new);
+		let state_override = state_override
+			.map(|per_address| {
+				per_address
+					.into_iter()
+					.map(|(address, slots)| (address, slots.into_iter().collect()))
+					.collect::<BTreeMap<H160, BTreeMap<H256, H256>>>()
+			})
+			.unwrap_or_default();
 		Self {
 			vicinity,
 			substate: SubstrateStackSubstate {
@@ -911,10 +1035,24 @@ impl<'vicinity, 'config, T: Config> SubstrateStackState<'vicinity, 'config, T> {
 			_marker: PhantomData,
 			original_storage: BTreeMap::new(),
 			transient_storage: BTreeMap::new(),
+			state_override,
+			state_override_journal: Vec::new(),
 			recorded: Default::default(),
 			weight_info,
 			storage_meter,
 		}
+	}
+
+	/// Resolve a storage slot for `address` as the EVM should observe it.
+	///
+	/// If an active state override covers `address`, the slot is served from the
+	/// in-memory override map (missing slots return zero, matching Geth's
+	/// "fresh state object" semantics). Otherwise the on-chain trie is read.
+	fn read_effective_storage(&self, address: H160, index: H256) -> H256 {
+		if let Some(slots) = self.state_override.get(&address) {
+			return slots.get(&index).copied().unwrap_or_default();
+		}
+		<AccountStorages<T>>::get(address, index)
 	}
 
 	pub fn weight_info(&self) -> Option<WeightInfo> {
@@ -1038,7 +1176,7 @@ where
 	}
 
 	fn storage(&self, address: H160, index: H256) -> H256 {
-		<AccountStorages<T>>::get(address, index)
+		self.read_effective_storage(address, index)
 	}
 
 	fn transient_storage(&self, address: H160, index: H256) -> H256 {
@@ -1053,7 +1191,7 @@ where
 			self.original_storage
 				.get(&(address, index))
 				.cloned()
-				.unwrap_or_else(|| self.storage(address, index)),
+				.unwrap_or_else(|| self.read_effective_storage(address, index)),
 		)
 	}
 }
@@ -1071,18 +1209,42 @@ where
 	}
 
 	fn enter(&mut self, gas_limit: u64, is_static: bool) {
+		// Journal the override alongside the Substrate storage transaction that
+		// `SubstrateStackSubstate::enter` opens, so an inner frame's SSTORE or
+		// SELFDESTRUCT-driven `reset_storage` against an overridden account can
+		// be rolled back on revert/discard (Geth StateDB parity).
+		// `None` when empty: child frames can't mutate an empty map, so we skip
+		// the clone while still pairing the push/pop with the substate frame.
+		let snapshot = (!self.state_override.is_empty()).then(|| self.state_override.clone());
+		self.state_override_journal.push(snapshot);
 		self.substate.enter(gas_limit, is_static)
 	}
 
 	fn exit_commit(&mut self) -> Result<(), ExitError> {
+		// Keep the mutated `state_override`; just drop the snapshot.
+		let _ = self.state_override_journal.pop();
 		self.substate.exit_commit()
 	}
 
 	fn exit_revert(&mut self) -> Result<(), ExitError> {
+		if let Some(snapshot) = self
+			.state_override_journal
+			.pop()
+			.expect("exit_revert paired with enter; snapshot always pushed")
+		{
+			self.state_override = snapshot;
+		}
 		self.substate.exit_revert()
 	}
 
 	fn exit_discard(&mut self) -> Result<(), ExitError> {
+		if let Some(snapshot) = self
+			.state_override_journal
+			.pop()
+			.expect("exit_discard paired with enter; snapshot always pushed")
+		{
+			self.state_override = snapshot;
+		}
 		self.substate.exit_discard()
 	}
 
@@ -1107,31 +1269,39 @@ where
 	fn set_storage(&mut self, address: H160, index: H256, value: H256) {
 		// We cache the current value if this is the first time we modify it
 		// in the transaction.
-		use alloc::collections::btree_map::Entry::Vacant;
-		if let Vacant(e) = self.original_storage.entry((address, index)) {
-			let original = <AccountStorages<T>>::get(address, index);
+		use alloc::collections::btree_map::Entry;
+		let original = self.read_effective_storage(address, index);
+		if let Entry::Vacant(e) = self.original_storage.entry((address, index)) {
 			// No need to cache if same value.
 			if original != value {
 				e.insert(original);
 			}
 		}
 
+		// Geth-parity: if this account has an active state override, writes
+		// update the override map (the account's "fresh state"), not the
+		// underlying trie. Subsequent SLOADs will observe the new value via
+		// `read_effective_storage`, while the on-chain storage stays untouched.
+		if let Some(slots) = self.state_override.get_mut(&address) {
+			if value == H256::default() {
+				slots.remove(&index);
+			} else {
+				slots.insert(index, value);
+			}
+			return;
+		}
+
 		// Then we insert or remove the entry based on the value.
 		if value == H256::default() {
 			log::debug!(
 				target: "evm",
-				"Removing storage for {:?} [index: {:?}]",
-				address,
-				index,
+				"Removing storage for {address:?} [index: {index:?}]"
 			);
 			<AccountStorages<T>>::remove(address, index);
 		} else {
 			log::debug!(
 				target: "evm",
-				"Updating storage for {:?} [index: {:?}, value: {:?}]",
-				address,
-				index,
-				value,
+				"Updating storage for {address:?} [index: {index:?}, value: {value:?}]"
 			);
 			<AccountStorages<T>>::insert(address, index, value);
 		}
@@ -1142,6 +1312,10 @@ where
 	}
 
 	fn reset_storage(&mut self, address: H160) {
+		// Geth-parity: once an account is destructed/recreated, the prior state
+		// override (if any) no longer applies — subsequent SLOADs must fall back
+		// to the (now-empty) persisted storage, returning zero until written.
+		self.state_override.remove(&address);
 		#[allow(deprecated)]
 		let _ = <AccountStorages<T>>::remove_prefix(address, None);
 	}
@@ -1170,7 +1344,35 @@ where
 			code.len(),
 			address
 		);
+
 		Pallet::<T>::create_account(address, code, caller)
+	}
+
+	fn set_delegation(
+		&mut self,
+		authority: H160,
+		delegation: evm::delegation::Delegation,
+	) -> Result<(), ExitError> {
+		log::debug!(
+			target: "evm",
+			"Inserting delegation (23 bytes) at {:?}",
+			delegation.address()
+		);
+
+		let meta = crate::CodeMetadata::from_code(&delegation.to_bytes());
+		<AccountCodesMetadata<T>>::insert(authority, meta);
+		<AccountCodes<T>>::insert(authority, delegation.to_bytes());
+		Ok(())
+	}
+
+	fn reset_delegation(&mut self, address: H160) -> Result<(), ExitError> {
+		log::debug!(
+			target: "evm",
+			"Resetting delegation at {address:?}"
+		);
+
+		Pallet::<T>::remove_account_code(&address);
+		Ok(())
 	}
 
 	fn transfer(&mut self, transfer: Transfer) -> Result<(), ExitError> {
@@ -1215,10 +1417,14 @@ where
 	}
 
 	fn code_size(&self, address: H160) -> U256 {
+		// EIP-7702: EXTCODESIZE does NOT follow delegations
+		// Return the actual code size at the address, including delegation designators
 		U256::from(<Pallet<T>>::account_code_metadata(address).size)
 	}
 
 	fn code_hash(&self, address: H160) -> H256 {
+		// EIP-7702: EXTCODEHASH does NOT follow delegations
+		// Return the hash of the actual code at the address, including delegation designators
 		<Pallet<T>>::account_code_metadata(address).hash
 	}
 
@@ -1480,6 +1686,7 @@ mod tests {
 				None,
 				None,
 				measured_proof_size_before,
+				None,
 				|_| {
 					let measured_proof_size_before2 = get_proof_size().unwrap_or_default();
 					let res = Runner::<Test>::execute(
@@ -1494,6 +1701,7 @@ mod tests {
 						None,
 						None,
 						measured_proof_size_before2,
+						None,
 						|_| (ExitReason::Succeed(ExitSucceed::Stopped), ()),
 					);
 					assert_matches!(
@@ -1528,6 +1736,7 @@ mod tests {
 				None,
 				None,
 				measured_proof_size_before,
+				None,
 				|_| (ExitReason::Succeed(ExitSucceed::Stopped), ()),
 			);
 			assert!(res.is_ok());

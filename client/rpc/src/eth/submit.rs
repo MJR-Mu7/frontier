@@ -21,11 +21,11 @@ use futures::future::TryFutureExt;
 use jsonrpsee::core::RpcResult;
 // Substrate
 use sc_client_api::backend::{Backend, StorageProvider};
-use sc_transaction_pool::ChainApi;
-use sc_transaction_pool_api::TransactionPool;
+use sc_transaction_pool_api::{InPoolTransaction, TransactionPool};
 use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_block_builder::BlockBuilder as BlockBuilderApi;
 use sp_blockchain::HeaderBackend;
+use sp_core::H160;
 use sp_inherents::CreateInherentDataProviders;
 use sp_runtime::{traits::Block as BlockT, transaction_validity::TransactionSource};
 // Frontier
@@ -34,22 +34,49 @@ use fp_rpc::{ConvertTransaction, ConvertTransactionRuntimeApi, EthereumRuntimeRP
 
 use crate::{
 	eth::{format, Eth},
-	internal_err, 
+	internal_err, public_key,
 };
 
-impl<B, C, P, CT, BE, A, CIDP, EC> Eth<B, C, P, CT, BE, A, CIDP, EC>
+fn is_unprotected_legacy_tx(transaction: &ethereum::TransactionV3) -> bool {
+	matches!(
+		transaction,
+		ethereum::TransactionV3::Legacy(tx) if tx.signature.chain_id().is_none()
+	)
+}
+
+fn should_reject_unprotected_legacy_tx(
+	transaction: &ethereum::TransactionV3,
+	allow_unprotected_txs: bool,
+) -> bool {
+	is_unprotected_legacy_tx(transaction) && !allow_unprotected_txs
+}
+
+impl<B, C, P, CT, BE, CIDP, EC> Eth<B, C, P, CT, BE, CIDP, EC>
 where
 	B: BlockT,
 	C: ProvideRuntimeApi<B>,
 	C::Api: BlockBuilderApi<B> + ConvertTransactionRuntimeApi<B> + EthereumRuntimeRPCApi<B>,
 	C: HeaderBackend<B> + StorageProvider<B, BE> + 'static,
 	BE: Backend<B> + 'static,
-	P: TransactionPool<Block = B> + 'static,
+	P: TransactionPool<Block = B, Hash = B::Hash> + 'static,
 	CT: ConvertTransaction<<B as BlockT>::Extrinsic> + 'static,
-	A: ChainApi<Block = B>,
 	CIDP: CreateInherentDataProviders<B, ()> + Send + 'static,
 {
-	/// Submits a new Ethereum transaction.
+	fn ensure_unprotected_legacy_tx_allowed(
+		&self,
+		transaction: &ethereum::TransactionV3,
+	) -> RpcResult<()> {
+		if should_reject_unprotected_legacy_tx(transaction, self.rpc_allow_unprotected_txs) {
+			// Runtime validation remains authoritative since peers can still gossip transactions
+			// over p2p and bypass RPC submission.
+			return Err(internal_err(
+				"unprotected legacy transactions are not allowed by RPC policy",
+			));
+		}
+
+		Ok(())
+	}
+
 	pub async fn send_transaction(&self, request: TransactionRequest) -> RpcResult<H256> {
 		let from = match request.from {
 			Some(from) => from,
@@ -145,6 +172,7 @@ where
 			Some(transaction) => transaction,
 			None => return Err(internal_err("no signer available")),
 		};
+		self.ensure_unprotected_legacy_tx_allowed(&transaction)?;
 		let transaction_hash = transaction.hash();
 
 		let extrinsic = self.convert_transaction(block_hash, transaction)?;
@@ -155,8 +183,7 @@ where
 			.map_err(|err| internal_err(format::Geth::pool_error(err)))
 			.await
 	}
-	
-	/// Submits a raw Ethereum transaction.
+
 	pub async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<H256> {
 		let bytes = bytes.into_vec();
 		if bytes.is_empty() {
@@ -168,6 +195,7 @@ where
 				Ok(transaction) => transaction,
 				Err(_) => return Err(internal_err("decode transaction failed")),
 			};
+		self.ensure_unprotected_legacy_tx_allowed(&transaction)?;
 		let transaction_hash = transaction.hash();
 
 		let block_hash = self.client.info().best_hash;
@@ -180,7 +208,63 @@ where
 			.await
 	}
 
-	/// Convert an Ethereum transaction into a Substrate extrinsic.
+	pub async fn pending_transactions(&self) -> RpcResult<Vec<Transaction>> {
+		let ready = self
+			.pool
+			.ready()
+			.map(|in_pool_tx| in_pool_tx.data().as_ref().clone())
+			.collect::<Vec<_>>();
+
+		let future = self
+			.pool
+			.futures()
+			.iter()
+			.map(|in_pool_tx| in_pool_tx.data().as_ref().clone())
+			.collect::<Vec<_>>();
+
+		let all_extrinsics = ready
+			.iter()
+			.chain(future.iter())
+			.cloned()
+			.collect::<Vec<_>>();
+
+		let best_block = self.client.info().best_hash;
+		let api = self.client.runtime_api();
+
+		let api_version = api
+			.api_version::<dyn EthereumRuntimeRPCApi<B>>(best_block)
+			.map_err(|err| internal_err(format!("Failed to get API version: {err}")))?
+			.ok_or_else(|| internal_err("Failed to get API version"))?;
+
+		let ethereum_txs = if api_version > 1 {
+			api.extrinsic_filter(best_block, all_extrinsics)
+				.map_err(|err| internal_err(format!("Runtime call failed: {err}")))?
+		} else {
+			#[allow(deprecated)]
+			let legacy = api
+				.extrinsic_filter_before_version_2(best_block, all_extrinsics)
+				.map_err(|err| internal_err(format!("Runtime call failed: {err}")))?;
+			legacy.into_iter().map(|tx| tx.into()).collect()
+		};
+
+		let transactions = ethereum_txs
+			.into_iter()
+			.filter_map(|tx| {
+				let pubkey = match public_key(&tx) {
+					Ok(pk) => H160::from(H256::from(sp_core::hashing::keccak_256(&pk))),
+					Err(_err) => {
+						// Skip transactions with invalid public keys
+						return None;
+					}
+				};
+
+				Some(Transaction::build_from(pubkey, &tx))
+			})
+			.collect();
+
+		Ok(transactions)
+	}
+
 	fn convert_transaction(
 		&self,
 		block_hash: B::Hash,
@@ -235,5 +319,80 @@ where
 				"`ConvertTransactionRuntimeApi` is not supported",
 			)),
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{is_unprotected_legacy_tx, should_reject_unprotected_legacy_tx};
+	use ethereum::{
+		legacy::TransactionSignature as LegacyTransactionSignature, LegacyTransaction,
+		TransactionAction, TransactionV3,
+	};
+	use rlp::RlpStream;
+	use sp_core::{hashing::keccak_256, H160, H256, U256};
+
+	fn legacy_tx_with_v(v: u64) -> TransactionV3 {
+		let nonce = U256::zero();
+		let gas_price = U256::from(1u8);
+		let gas_limit = U256::from(21_000u64);
+		let action = TransactionAction::Call(H160::default());
+		let value = U256::zero();
+		let input = Vec::new();
+
+		let mut stream = RlpStream::new_list(6);
+		stream.append(&nonce);
+		stream.append(&gas_price);
+		stream.append(&gas_limit);
+		stream.append(&action);
+		stream.append(&value);
+		stream.append(&input);
+		let hash = H256::from(keccak_256(&stream.out()));
+		let msg = libsecp256k1::Message::parse(hash.as_fixed_bytes());
+		let secret = libsecp256k1::SecretKey::parse_slice(&[1u8; 32]).expect("valid secret key");
+		let (signature, _) = libsecp256k1::sign(&msg, &secret);
+		let rs = signature.serialize();
+
+		TransactionV3::Legacy(LegacyTransaction {
+			nonce,
+			gas_price,
+			gas_limit,
+			action,
+			value,
+			input,
+			signature: LegacyTransactionSignature::new(
+				v,
+				H256::from_slice(&rs[0..32]),
+				H256::from_slice(&rs[32..64]),
+			)
+			.expect("valid legacy signature"),
+		})
+	}
+
+	#[test]
+	fn detects_unprotected_legacy_transaction() {
+		let tx = legacy_tx_with_v(27);
+
+		assert!(is_unprotected_legacy_tx(&tx));
+	}
+
+	#[test]
+	fn ignores_protected_legacy_transaction() {
+		let tx = legacy_tx_with_v(37);
+
+		assert!(!is_unprotected_legacy_tx(&tx));
+	}
+
+	#[test]
+	fn reject_decision_respects_policy() {
+		let unprotected_legacy = legacy_tx_with_v(27);
+		assert!(should_reject_unprotected_legacy_tx(
+			&unprotected_legacy,
+			false
+		));
+		assert!(!should_reject_unprotected_legacy_tx(
+			&unprotected_legacy,
+			true
+		));
 	}
 }

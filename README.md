@@ -1,19 +1,13 @@
-# INSPIRED BY THE POLKADOT FRONTIER PROJECT AND TAKES ALL FILES AND CODE FROM THE POLKADOT ECOSYSTEM
-
+# INSPIRED BY THE POLKADOT-FRONTIER PROJECT AND TAKES ALL FILES AND CODE FROM THE POLKADOT ECOSYSTEM
 ## Kahawa Frontier
 
 [![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/MJR-Mu7/frontier/test.yml)](https://github.com/MJR-Mu7/frontier/actions)
 [![Matrix](https://img.shields.io/matrix/frontier:matrix.org)](https://matrix.to/#/#frontier:matrix.org)
 
-Frontier is the EVM backbone of Kahawa.
+Frontier is the EVM backbone of Kahawa and Kobole blockchains.
 
 ## Features
-
-Frontier provides a compatibility layer of EVM, so that you can run any Ethereum dapps on Kahawa, unmodified.
-Using Frontier, you get access to all the Ethereum RPC APIs you are already familiar with, and therefore you can continue to develop your dapps in your favourite Ethereum developer tools.
-As a bonus, you can even run many Ethereum L2s inside Frontier!
-For those looking to become acquainted with Frontier, consult the documentation provided [here](./docs).
-Additionally, a [template node](./template/README.md) is available to facilitate a more comprehensive technical exploration.
+This version features a custom client RPC that handles BabeConsensusDataProvider allowing NPoS and PoS chains to add EVM via Frontier to their ecosystem.
 
 Frontier is also a migration framework.
 Besides the common strategy of direct state export/import and transaction-level replays, Frontier's Pre-Log Wrapper Block feature provides a possible method for a zero-downtime live migration.

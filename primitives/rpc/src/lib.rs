@@ -24,17 +24,27 @@ extern crate alloc;
 use alloc::vec::Vec;
 use ethereum::{AuthorizationList, Log};
 use ethereum_types::{Address, Bloom};
-use scale_codec::{Decode, Encode};
+use scale_codec::{Decode, DecodeWithMemTracking, Encode};
 use scale_info::TypeInfo;
 // Substrate
 use sp_core::{H256, U256};
 use sp_runtime::{
 	traits::{Block as BlockT, HashingFor},
-	Permill, RuntimeDebug,
+	Debug, Permill,
 };
 use sp_state_machine::OverlayedChanges;
 
-#[derive(Clone, Eq, PartialEq, Default, RuntimeDebug, Encode, Decode, TypeInfo)]
+#[derive(
+	Clone,
+	Eq,
+	PartialEq,
+	Default,
+	Debug,
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	TypeInfo
+)]
 pub struct TransactionStatus {
 	pub transaction_hash: H256,
 	pub transaction_index: u32,
@@ -84,7 +94,7 @@ impl<B: BlockT, C> RuntimeStorageOverride<B, C> for () {
 
 sp_api::decl_runtime_apis! {
 	/// API necessary for Ethereum-compatibility layer.
-	#[api_version(6)]
+	#[api_version(7)]
 	pub trait EthereumRuntimeRPCApi {
 		/// Returns runtime defined pallet_evm::ChainId.
 		fn chain_id() -> u64;
@@ -154,7 +164,7 @@ sp_api::decl_runtime_apis! {
 			estimate: bool,
 			access_list: Option<Vec<(Address, Vec<H256>)>>,
 		) -> Result<fp_evm::ExecutionInfoV2::<Vec<u8>>, sp_runtime::DispatchError>;
-		#[allow(clippy::type_complexity)]
+		#[changed_in(7)]
 		fn call(
 			from: Address,
 			to: Address,
@@ -167,6 +177,20 @@ sp_api::decl_runtime_apis! {
 			estimate: bool,
 			access_list: Option<Vec<(Address, Vec<H256>)>>,
 			authorization_list: Option<AuthorizationList>,
+		) -> Result<fp_evm::ExecutionInfoV2::<Vec<u8>>, sp_runtime::DispatchError>;
+		fn call(
+			from: Address,
+			to: Address,
+			data: Vec<u8>,
+			value: U256,
+			gas_limit: U256,
+			max_fee_per_gas: Option<U256>,
+			max_priority_fee_per_gas: Option<U256>,
+			nonce: Option<U256>,
+			estimate: bool,
+			access_list: Option<Vec<(Address, Vec<H256>)>>,
+			authorization_list: Option<AuthorizationList>,
+			state_override: fp_evm::StateOverride,
 		) -> Result<fp_evm::ExecutionInfoV2::<Vec<u8>>, sp_runtime::DispatchError>;
 
 		/// Returns a frame_ethereum::create response.

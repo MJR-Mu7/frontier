@@ -103,6 +103,7 @@ pub fn run() -> sc_cli::Result<()> {
 				match cli.eth.frontier_backend_type {
 					crate::eth::BackendType::KeyValue => {
 						let frontier_database_config = match config.database {
+							#[cfg(feature = "rocksdb")]
 							DatabaseSource::RocksDb { .. } => DatabaseSource::RocksDb {
 								path: frontier_database_dir(&db_config_dir, "db"),
 								cache_size: 0,
@@ -130,11 +131,9 @@ pub fn run() -> sc_cli::Result<()> {
 								eprintln!("{:?} did not exist.", &db_path);
 							}
 							Err(err) => {
-								return Err(format!(
-									"Cannot purge `{:?}` database: {:?}",
-									db_path, err,
+								return Err(
+									format!("Cannot purge `{db_path:?}` database: {err:?}").into()
 								)
-								.into())
 							}
 						};
 					}

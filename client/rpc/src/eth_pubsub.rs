@@ -19,8 +19,10 @@
 use std::{marker::PhantomData, sync::Arc};
 
 use ethereum::TransactionV3 as EthereumTransaction;
-use futures::{future, FutureExt as _, StreamExt as _};
+use futures::{future, stream::BoxStream, FutureExt as _, StreamExt as _};
 use jsonrpsee::{core::traits::IdProvider, server::PendingSubscriptionSink};
+use log::debug;
+use tokio::sync::broadcast::error::RecvError;
 // Substrate
 use sc_client_api::{
 	backend::{Backend, StorageProvider},
@@ -49,6 +51,8 @@ use fc_rpc_core::{
 use fc_storage::StorageOverride;
 use fp_rpc::EthereumRuntimeRPCApi;
 
+use crate::{eth::filter::log_matches_filter, LogsJournal};
+
 #[derive(Clone, Debug)]
 pub struct EthereumSubIdProvider;
 impl IdProvider for EthereumSubIdProvider {
@@ -67,6 +71,7 @@ pub struct EthPubSub<B: BlockT, P, C, BE> {
 	storage_override: Arc<dyn StorageOverride<B>>,
 	starting_block: u64,
 	pubsub_notification_sinks: Arc<EthereumBlockNotificationSinks<EthereumBlockNotification<B>>>,
+	logs_journal: Arc<LogsJournal>,
 	_marker: PhantomData<BE>,
 }
 
@@ -80,6 +85,7 @@ impl<B: BlockT, P, C, BE> Clone for EthPubSub<B, P, C, BE> {
 			storage_override: self.storage_override.clone(),
 			starting_block: self.starting_block,
 			pubsub_notification_sinks: self.pubsub_notification_sinks.clone(),
+			logs_journal: self.logs_journal.clone(),
 			_marker: PhantomData::<BE>,
 		}
 	}
@@ -87,7 +93,7 @@ impl<B: BlockT, P, C, BE> Clone for EthPubSub<B, P, C, BE> {
 
 impl<B: BlockT, P, C, BE> EthPubSub<B, P, C, BE>
 where
-	P: TransactionPool<Block = B> + 'static,
+	P: TransactionPool<Block = B, Hash = B::Hash> + 'static,
 	C: ProvideRuntimeApi<B>,
 	C::Api: EthereumRuntimeRPCApi<B>,
 	C: HeaderBackend<B> + StorageProvider<B, BE>,
@@ -102,6 +108,7 @@ where
 		pubsub_notification_sinks: Arc<
 			EthereumBlockNotificationSinks<EthereumBlockNotification<B>>,
 		>,
+		logs_journal: Arc<LogsJournal>,
 	) -> Self {
 		// Capture the best block as seen on initialization. Used for syncing subscriptions.
 		let best_number = client.info().best_number;
@@ -114,41 +121,48 @@ where
 			storage_override,
 			starting_block,
 			pubsub_notification_sinks,
+			logs_journal,
 			_marker: PhantomData,
 		}
 	}
 
-	fn notify_header(
+	/// Convert a block notification into a stream of `newHeads` items.
+	/// For reorgs this emits enacted headers followed by the new best block.
+	fn new_heads_from_notification(
 		&self,
 		notification: EthereumBlockNotification<B>,
-	) -> future::Ready<Option<PubSubResult>> {
-		let res = if notification.is_new_best {
-			self.storage_override.current_block(notification.hash)
-		} else {
-			None
-		};
-		future::ready(res.map(PubSubResult::header))
-	}
+	) -> BoxStream<'static, PubSubResult> {
+		if !notification.is_new_best {
+			return futures::stream::empty().boxed();
+		}
 
-	fn notify_logs(
-		&self,
-		notification: EthereumBlockNotification<B>,
-		params: &FilteredParams,
-	) -> future::Ready<Option<impl Iterator<Item = PubSubResult>>> {
-		let res = if notification.is_new_best {
-			let substrate_hash = notification.hash;
+		if let Some(reorg_info) = notification.reorg_info {
+			debug!(
+				target: "eth-pubsub",
+				"Reorg detected: new_best={:?}, {} blocks retracted, {} blocks enacted",
+				reorg_info.new_best,
+				reorg_info.retracted.len(),
+				reorg_info.enacted.len()
+			);
 
-			let block = self.storage_override.current_block(substrate_hash);
-			let receipts = self.storage_override.current_receipts(substrate_hash);
+			let pubsub = self.clone();
+			let enacted = reorg_info.enacted.clone();
+			let new_best = reorg_info.new_best;
+			return futures::stream::iter(
+				enacted
+					.into_iter()
+					.chain(std::iter::once(new_best))
+					.filter_map(move |hash| pubsub.storage_override.current_block(hash))
+					.map(PubSubResult::header),
+			)
+			.boxed();
+		}
 
-			match (block, receipts) {
-				(Some(block), Some(receipts)) => Some((block, receipts)),
-				_ => None,
-			}
-		} else {
-			None
-		};
-		future::ready(res.map(|(block, receipts)| PubSubResult::logs(block, receipts, params)))
+		let maybe_header = self
+			.storage_override
+			.current_block(notification.hash)
+			.map(PubSubResult::header);
+		futures::stream::iter(maybe_header).boxed()
 	}
 
 	fn pending_transactions(&self, hash: &TxHash<P>) -> future::Ready<Option<PubSubResult>> {
@@ -221,7 +235,7 @@ where
 impl<B: BlockT, P, C, BE> EthPubSubApiServer for EthPubSub<B, P, C, BE>
 where
 	B: BlockT,
-	P: TransactionPool<Block = B> + 'static,
+	P: TransactionPool<Block = B, Hash = B::Hash> + 'static,
 	C: ProvideRuntimeApi<B>,
 	C::Api: EthereumRuntimeRPCApi<B>,
 	C: BlockchainEvents<B> + 'static,
@@ -230,33 +244,72 @@ where
 {
 	fn subscribe(&self, pending: PendingSubscriptionSink, kind: Kind, params: Option<Params>) {
 		let filtered_params = match params {
-			Some(Params::Logs(filter)) => FilteredParams::new(Some(filter)),
+			Some(Params::Logs(filter)) => FilteredParams::new(filter),
 			_ => FilteredParams::default(),
 		};
 
 		let pubsub = self.clone();
-		// Everytime a new subscription is created, a new mpsc channel is added to the sink pool.
-		let (inner_sink, block_notification_stream) =
-			sc_utils::mpsc::tracing_unbounded("pubsub_notification_stream", 100_000);
-		self.pubsub_notification_sinks.lock().push(inner_sink);
 
 		let fut = async move {
 			match kind {
 				Kind::NewHeads => {
-					let stream = block_notification_stream
-						.filter_map(move |notification| pubsub.notify_header(notification));
+					let (inner_sink, block_notification_stream) =
+						sc_utils::mpsc::tracing_unbounded("pubsub_notification_stream", 100_000);
+					pubsub.pubsub_notification_sinks.lock().push(inner_sink);
+					// Per Ethereum spec, when a reorg occurs, we must emit all headers
+					// for the new canonical chain. The reorg_info field in the notification
+					// contains the enacted blocks when a reorg occurred.
+					let flat_stream = block_notification_stream.flat_map(move |notification| {
+						pubsub.new_heads_from_notification(notification)
+					});
+
 					PendingSubscription::from(pending)
-						.pipe_from_stream(stream, BoundedVecDeque::new(16))
+						.pipe_from_stream(flat_stream, BoundedVecDeque::new(16))
 						.await
 				}
 				Kind::Logs => {
-					let stream = block_notification_stream
-						.filter_map(move |notification| {
-							pubsub.notify_logs(notification, &filtered_params)
-						})
-						.flat_map(futures::stream::iter);
+					let logs_params = filtered_params.clone();
+					let journal_rx = pubsub.logs_journal.subscribe();
+					let stream = futures::stream::unfold(journal_rx, move |mut rx| {
+						let logs_params = logs_params.clone();
+						async move {
+							loop {
+								let entry = match rx.recv().await {
+									Ok(e) => e,
+									Err(RecvError::Lagged(n)) => {
+										debug!(
+											target: "eth-pubsub",
+											"Closing logs subscription; lagged behind logs journal by {n} entries"
+										);
+										return None;
+									}
+									Err(RecvError::Closed) => return None,
+								};
+
+								if !entry.complete {
+									debug!(
+										target: "eth-pubsub",
+										"Closing logs subscription after incomplete journal entry",
+									);
+									return None;
+								}
+
+								let results: Vec<PubSubResult> = entry
+									.logs
+									.iter()
+									.filter(|log| log_matches_filter(&logs_params, log, false))
+									.map(|log| PubSubResult::Log(Box::new(log.clone())))
+									.collect();
+
+								if !results.is_empty() {
+									return Some((results, rx));
+								}
+							}
+						}
+					})
+					.flat_map(futures::stream::iter);
 					PendingSubscription::from(pending)
-						.pipe_from_stream(stream, BoundedVecDeque::new(16))
+						.pipe_from_stream(Box::pin(stream), BoundedVecDeque::new(16))
 						.await
 				}
 				Kind::NewPendingTransactions => {
@@ -277,9 +330,13 @@ where
 					// in case of reorg, the first event is emitted right away.
 					let syncing_status = pubsub.syncing_status().await;
 					let subscription = Subscription::from(sink);
-					let _ = subscription
+					if subscription
 						.send(&PubSubResult::SyncingStatus(syncing_status))
-						.await;
+						.await
+						.is_err()
+					{
+						return;
+					}
 
 					// When the node is not under a major syncing (i.e. from genesis), react
 					// normally to import notifications.
@@ -291,9 +348,13 @@ where
 						let syncing_status = pubsub.sync.is_major_syncing();
 						if syncing_status != last_syncing_status {
 							let syncing_status = pubsub.syncing_status().await;
-							let _ = subscription
+							if subscription
 								.send(&PubSubResult::SyncingStatus(syncing_status))
-								.await;
+								.await
+								.is_err()
+							{
+								break;
+							}
 						}
 						last_syncing_status = syncing_status;
 					}

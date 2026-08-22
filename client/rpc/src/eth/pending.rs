@@ -18,8 +18,7 @@
 
 // Substrate
 use sc_client_api::backend::{Backend, StorageProvider};
-use sc_transaction_pool::ChainApi;
-use sc_transaction_pool_api::InPoolTransaction;
+use sc_transaction_pool_api::{InPoolTransaction, TransactionPool};
 use sp_api::{ApiExt, ApiRef, Core, ProvideRuntimeApi};
 use sp_block_builder::BlockBuilder as BlockBuilderApi;
 use sp_blockchain::{ApplyExtrinsicFailed, HeaderBackend};
@@ -48,9 +47,11 @@ pub(crate) enum Error {
 	Backend(#[from] sp_blockchain::Error),
 	#[error(transparent)]
 	ApplyExtrinsicFailed(#[from] ApplyExtrinsicFailed),
+	#[error("BABE inherent data missing")]
+    MissingInherent,
 }
 
-impl<B, C, P, CT, BE, A, CIDP, EC> Eth<B, C, P, CT, BE, A, CIDP, EC>
+impl<B, C, P, CT, BE, CIDP, EC> Eth<B, C, P, CT, BE, CIDP, EC>
 where
 	B: BlockT,
 	C: ProvideRuntimeApi<B>,
@@ -58,8 +59,8 @@ where
 	C::Api: EthereumRuntimeRPCApi<B>,
 	C: HeaderBackend<B> + StorageProvider<B, BE> + 'static,
 	BE: Backend<B>,
-	A: ChainApi<Block = B>,
 	CIDP: CreateInherentDataProviders<B, ()> + Send + 'static,
+	P: TransactionPool<Block = B, Hash = B::Hash> + 'static,
 {
 	/// Creates a pending runtime API.
 	pub(crate) async fn pending_runtime_api(&self) -> Result<(B::Hash, ApiRef<C::Api>), Error> {
@@ -122,8 +123,7 @@ where
 
 		// Get all extrinsics from the ready queue.
 		let extrinsics: Vec<<B as BlockT>::Extrinsic> = self
-			.graph
-			.validated_pool()
+			.pool
 			.ready()
 			.map(|in_pool_tx| in_pool_tx.data().as_ref().clone())
 			.collect::<Vec<<B as BlockT>::Extrinsic>>();
@@ -163,65 +163,49 @@ impl<B: BlockT> ConsensusDataProvider<B> for () {
 	}
 }
 
-#[cfg(feature = "aura")]
-pub use self::aura::AuraConsensusDataProvider;
-#[cfg(feature = "aura")]
-mod aura {
+pub use self::babe::BabeConsensusDataProvider;
+mod babe {
 	use super::*;
-	use sc_client_api::{AuxStore, UsageProvider};
-	use sp_consensus_aura::{
-		digests::CompatibleDigestItem,
-		sr25519::{AuthorityId, AuthoritySignature},
-		AuraApi, Slot, SlotDuration,
+	use sp_runtime::{ DigestItem };
+	use sc_consensus_babe::{ CompatibleDigestItem };
+	use sp_consensus_babe::{
+		digests::{PreDigest, SecondaryPlainPreDigest},
+		inherents::BabeInherentData,
 	};
-	use sp_runtime::generic::DigestItem;
-	use sp_timestamp::TimestampInherentData;
-	use std::{marker::PhantomData, sync::Arc};
 
-	/// Consensus data provider for Aura.
-	pub struct AuraConsensusDataProvider<B, C> {
-		// slot duration
-		slot_duration: SlotDuration,
-		// phantom data for required generics
-		_phantom: PhantomData<(B, C)>,
-	}
-
-	impl<B, C> AuraConsensusDataProvider<B, C>
-	where
-		B: BlockT,
-		C: AuxStore + ProvideRuntimeApi<B> + UsageProvider<B>,
-		C::Api: AuraApi<B, AuthorityId>,
-	{
-		/// Creates a new instance of the [`AuraConsensusDataProvider`], requires that `client`
-		/// implements [`sp_consensus_aura::AuraApi`]
-		pub fn new(client: Arc<C>) -> Self {
-			let slot_duration = sc_consensus_aura::slot_duration(&*client)
-				.expect("slot_duration is always present; qed.");
-			Self {
-				slot_duration,
-				_phantom: PhantomData,
-			}
+	impl From<Error> for sp_inherents::Error {
+		fn from(err: Error) -> Self {
+			sp_inherents::Error::Application(Box::new(err))
 		}
 	}
 
-	impl<B: BlockT, C: Send + Sync> ConsensusDataProvider<B> for AuraConsensusDataProvider<B, C> {
+	pub struct BabeConsensusDataProvider {}
+
+	impl BabeConsensusDataProvider {
+		pub fn new() -> Self {
+			Self {}
+		}
+	}
+	
+	impl<B> ConsensusDataProvider<B> for BabeConsensusDataProvider
+	where
+		B: BlockT,
+	{
 		fn create_digest(
 			&self,
-			_parent: &B::Header,
-			data: &InherentData,
-		) -> Result<Digest, sp_inherents::Error> {
-			let timestamp = data
-				.timestamp_inherent_data()?
-				.expect("Timestamp is always present; qed");
-
-			let digest_item =
-				<DigestItem as CompatibleDigestItem<AuthoritySignature>>::aura_pre_digest(
-					Slot::from_timestamp(timestamp, self.slot_duration),
-				);
-
-			Ok(Digest {
-				logs: vec![digest_item],
-			})
+			_parent: &<B as BlockT>::Header,
+			data: &sp_inherents::InherentData,
+		) -> Result<sp_runtime::Digest, sp_inherents::Error> {
+			let slot = data
+				.babe_inherent_data()?
+				.ok_or(sp_inherents::Error::Application(Box::new(Error::MissingInherent)))?;
+	
+			let predigest =
+				PreDigest::SecondaryPlain(SecondaryPlainPreDigest { slot, authority_index: 0 });
+	
+			let logs = vec![<DigestItem as CompatibleDigestItem>::babe_pre_digest(predigest)];
+	
+			Ok(sp_runtime::Digest { logs })
 		}
 	}
 }

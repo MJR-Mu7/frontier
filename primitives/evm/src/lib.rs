@@ -27,7 +27,7 @@ mod validation;
 
 use alloc::{collections::BTreeMap, vec::Vec};
 use frame_support::weights::{constants::WEIGHT_REF_TIME_PER_MILLIS, Weight};
-use scale_codec::{Decode, Encode};
+use scale_codec::{Decode, DecodeWithMemTracking, Encode};
 use scale_info::TypeInfo;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,12 @@ pub use evm::{
 	backend::{Basic as Account, Log},
 	Config, ExitReason, Opcode,
 };
+
+/// Default EVM configuration.
+pub static EVM_CONFIG: Config = Config::osaka();
+
+/// EIP-7825: Maximum transaction gas limit (2^24).
+pub const MAX_TRANSACTION_GAS_LIMIT: U256 = U256([16_777_216, 0, 0, 0]);
 
 pub use self::{
 	account_provider::AccountProvider,
@@ -63,6 +69,18 @@ pub struct Vicinity {
 	pub origin: H160,
 }
 
+/// Per-account EVM storage override payload (Geth-style `state` override).
+///
+/// Each entry is `(address, slots)` where `slots` is `[(key, value), ...]`.
+/// When an address is present, its persisted storage is fully replaced: reads
+/// are served exclusively from the provided slot list and missing keys return
+/// zero. An empty `slots` vector represents a full storage wipe (the
+/// `"state": {}` case).
+///
+/// `None` means no state overrides at all. The encoding cost is bounded by the
+/// caller-supplied payload size (Geth parity); no on-chain storage is enumerated.
+pub type StateOverride = Option<Vec<(H160, Vec<(H256, H256)>)>>;
+
 /// `System::Account` 16(hash) + 20 (key) + 72 (AccountInfo::max_encoded_len)
 pub const ACCOUNT_BASIC_PROOF_SIZE: u64 = 108;
 /// `AccountCodesMetadata` read, temtatively 16 (hash) + 20 (key) + 40 (CodeMetadata).
@@ -81,7 +99,18 @@ pub enum AccessedStorage {
 	AccountStorages((H160, H256)),
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Debug, Encode, Decode, Default, TypeInfo)]
+#[derive(
+	Clone,
+	Copy,
+	Eq,
+	PartialEq,
+	Debug,
+	Encode,
+	Decode,
+	DecodeWithMemTracking,
+	Default,
+	TypeInfo
+)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct WeightInfo {
 	pub ref_time_limit: Option<u64>,

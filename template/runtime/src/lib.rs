@@ -8,6 +8,10 @@
 
 extern crate alloc;
 
+mod genesis_config_preset;
+mod precompiles;
+mod weights;
+
 // Make the WASM binary available.
 #[cfg(feature = "std")]
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
@@ -36,11 +40,14 @@ use sp_version::RuntimeVersion;
 // Substrate FRAME
 #[cfg(feature = "with-paritydb-weights")]
 use frame_support::weights::constants::ParityDbWeight as RuntimeDbWeight;
-#[cfg(feature = "with-rocksdb-weights")]
+#[cfg(all(
+	feature = "with-rocksdb-weights",
+	not(feature = "with-paritydb-weights")
+))]
 use frame_support::weights::constants::RocksDbWeight as RuntimeDbWeight;
 use frame_support::{
 	derive_impl,
-	genesis_builder_helper::{build_state, get_preset},
+	genesis_builder_helper::build_state,
 	parameter_types,
 	traits::{ConstBool, ConstU32, ConstU64, ConstU8, FindAuthor, OnFinalize, OnTimestampSet},
 	weights::{constants::WEIGHT_REF_TIME_PER_MILLIS, IdentityFee, Weight},
@@ -62,7 +69,6 @@ pub use frame_system::Call as SystemCall;
 pub use pallet_balances::Call as BalancesCall;
 pub use pallet_timestamp::Call as TimestampCall;
 
-mod precompiles;
 use precompiles::FrontierPrecompiles;
 
 /// Type of block number.
@@ -210,8 +216,12 @@ parameter_types! {
 	pub const BlockHashCount: BlockNumber = 256;
 	pub BlockWeights: frame_system::limits::BlockWeights = frame_system::limits::BlockWeights
 		::with_sensible_defaults(MAXIMUM_BLOCK_WEIGHT, NORMAL_DISPATCH_RATIO);
-	pub BlockLength: frame_system::limits::BlockLength = frame_system::limits::BlockLength
-		::max_with_normal_ratio(MAXIMUM_BLOCK_LENGTH, NORMAL_DISPATCH_RATIO);
+	pub BlockLength: frame_system::limits::BlockLength = frame_system::limits::BlockLength::builder()
+		.max_length(MAXIMUM_BLOCK_LENGTH)
+		.modify_max_length_for_class(frame_support::dispatch::DispatchClass::Normal, |m| {
+			*m = NORMAL_DISPATCH_RATIO * *m
+		})
+		.build();
 	pub const SS58Prefix: u8 = 42;
 }
 
@@ -351,6 +361,7 @@ const MAX_STORAGE_GROWTH: u64 = 400 * 1024;
 
 parameter_types! {
 	pub BlockGasLimit: U256 = U256::from(BLOCK_GAS_LIMIT);
+	pub TransactionGasLimit: Option<U256> = Some(fp_evm::MAX_TRANSACTION_GAS_LIMIT);
 	pub const GasLimitPovSizeRatio: u64 = BLOCK_GAS_LIMIT.saturating_div(MAX_POV_SIZE);
 	pub const GasLimitStorageGrowthRatio: u64 = BLOCK_GAS_LIMIT.saturating_div(MAX_STORAGE_GROWTH);
 	pub PrecompilesValue: FrontierPrecompiles<Runtime> = FrontierPrecompiles::<_>::new();
@@ -371,6 +382,7 @@ impl pallet_evm::Config for Runtime {
 	type PrecompilesValue = PrecompilesValue;
 	type ChainId = EVMChainId;
 	type BlockGasLimit = BlockGasLimit;
+	type TransactionGasLimit = TransactionGasLimit;
 	type Runner = pallet_evm::runner::stack::Runner<Self>;
 	type OnChargeTransaction = ();
 	type OnCreate = ();
@@ -385,12 +397,14 @@ impl pallet_evm::Config for Runtime {
 
 parameter_types! {
 	pub const PostBlockAndTxnHashes: PostLogContent = PostLogContent::BlockAndTxnHashes;
+	pub const AllowUnprotectedTxs: bool = false;
 }
 
 impl pallet_ethereum::Config for Runtime {
 	type StateRoot = pallet_ethereum::IntermediateStateRoot<Self::Version>;
 	type PostLogContent = PostBlockAndTxnHashes;
 	type ExtraDataLength = ConstU32<30>;
+	type AllowUnprotectedTxs = AllowUnprotectedTxs;
 }
 
 parameter_types! {
@@ -596,6 +610,8 @@ mod benches {
 		[pallet_timestamp, Timestamp]
 		[pallet_sudo, Sudo]
 		[pallet_evm, EVM]
+		[pallet_evm_precompile_curve25519, EVMPrecompileCurve25519Bench::<Runtime>]
+		[pallet_evm_precompile_sha3fips, EVMPrecompileSha3FIPSBench::<Runtime>]
 	);
 }
 
@@ -605,7 +621,7 @@ impl_runtime_apis! {
 			VERSION
 		}
 
-		fn execute_block(block: Block) {
+		fn execute_block(block: <Block as BlockT>::LazyBlock) {
 			Executive::execute_block(block)
 		}
 
@@ -642,7 +658,7 @@ impl_runtime_apis! {
 		}
 
 		fn check_inherents(
-			block: Block,
+			block: <Block as BlockT>::LazyBlock,
 			data: sp_inherents::InherentData,
 		) -> sp_inherents::CheckInherentsResult {
 			data.check_extrinsics(&block)
@@ -671,17 +687,17 @@ impl_runtime_apis! {
 		}
 
 		fn get_preset(id: &Option<PresetId>) -> Option<Vec<u8>> {
-			get_preset::<RuntimeGenesisConfig>(id, |_| None)
+			frame_support::genesis_builder_helper::get_preset::<RuntimeGenesisConfig>(id, genesis_config_preset::get_preset)
 		}
 
 		fn preset_names() -> Vec<sp_genesis_builder::PresetId> {
-			vec![]
+			vec![PresetId::from(sp_genesis_builder::DEV_RUNTIME_PRESET)]
 		}
 	}
 
 	impl sp_session::SessionKeys<Block> for Runtime {
-		fn generate_session_keys(seed: Option<Vec<u8>>) -> Vec<u8> {
-			opaque::SessionKeys::generate(seed)
+		fn generate_session_keys(owner: Vec<u8>, seed: Option<Vec<u8>>) -> sp_session::OpaqueGeneratedSessionKeys {
+			opaque::SessionKeys::generate(&owner, seed).into()
 		}
 
 		fn decode_session_keys(
@@ -803,6 +819,7 @@ impl_runtime_apis! {
 			estimate: bool,
 			access_list: Option<Vec<(H160, Vec<H256>)>>,
 			authorization_list: Option<AuthorizationList>,
+			state_override: fp_evm::StateOverride,
 		) -> Result<pallet_evm::CallInfo, sp_runtime::DispatchError> {
 			use pallet_evm::GasWeightMapping as _;
 
@@ -873,6 +890,7 @@ impl_runtime_apis! {
 				true,
 				weight_limit,
 				proof_size_base_cost,
+				state_override,
 				config.as_ref().unwrap_or(<Runtime as pallet_evm::Config>::config()),
 			).map_err(|err| err.error.into())
 		}
@@ -1038,6 +1056,9 @@ impl_runtime_apis! {
 			use baseline::Pallet as BaselineBench;
 			use frame_system_benchmarking::Pallet as SystemBench;
 
+			use pallet_evm_precompile_curve25519_benchmarking::Pallet as EVMPrecompileCurve25519Bench;
+			use pallet_evm_precompile_sha3fips_benchmarking::Pallet as EVMPrecompileSha3FIPSBench;
+
 			let mut list = Vec::<BenchmarkList>::new();
 			list_benchmarks!(list, extra);
 
@@ -1054,9 +1075,13 @@ impl_runtime_apis! {
 
 			use baseline::Pallet as BaselineBench;
 			use frame_system_benchmarking::Pallet as SystemBench;
+			use pallet_evm_precompile_curve25519_benchmarking::Pallet as EVMPrecompileCurve25519Bench;
+			use pallet_evm_precompile_sha3fips_benchmarking::Pallet as EVMPrecompileSha3FIPSBench;
 
 			impl baseline::Config for Runtime {}
 			impl frame_system_benchmarking::Config for Runtime {}
+			impl pallet_evm_precompile_curve25519_benchmarking::Config for Runtime {}
+			impl pallet_evm_precompile_sha3fips_benchmarking::Config for Runtime {}
 
 			let whitelist: Vec<TrackedStorageKey> = Vec::new();
 

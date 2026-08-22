@@ -105,7 +105,8 @@ impl sp_runtime::traits::Convert<H160, MockAccount> for MockAccount {
 	Clone,
 	Encode,
 	Decode,
-	sp_core::RuntimeDebug,
+	DecodeWithMemTracking,
+	Debug,
 	TypeInfo,
 	Serialize,
 	Deserialize
@@ -128,6 +129,7 @@ impl From<sp_runtime::MultiSignature> for MockSignature {
 				panic!("Sr25519 not supported for MockSignature")
 			}
 			sp_runtime::MultiSignature::Ecdsa(sig) => Self(sig),
+			sp_runtime::MultiSignature::Eth(sig) => Self(sp_core::ecdsa::Signature::from(sig.0)),
 		}
 	}
 }
@@ -168,7 +170,8 @@ impl sp_runtime::traits::Verify for MockSignature {
 	Clone,
 	Encode,
 	Decode,
-	sp_core::RuntimeDebug,
+	DecodeWithMemTracking,
+	Debug,
 	TypeInfo
 )]
 #[cfg_attr(feature = "std", derive(serde::Serialize, serde::Deserialize))]

@@ -30,6 +30,7 @@ mod cache;
 mod debug;
 mod eth;
 mod eth_pubsub;
+mod logs_journal;
 mod net;
 mod signer;
 #[cfg(feature = "txpool")]
@@ -43,6 +44,7 @@ pub use self::{
 	debug::Debug,
 	eth::{format, pending, EstimateGasAdapter, Eth, EthConfig, EthFilter},
 	eth_pubsub::{EthPubSub, EthereumSubIdProvider},
+	logs_journal::{LogsJournal, LogsJournalConfig, LogsJournalEntry, LogsJournalError},
 	net::Net,
 	signer::{EthDevSigner, EthSigner},
 	web3::Web3,
@@ -208,7 +210,7 @@ pub mod frontier_backend_client {
 			BlockNumberOrHash::Latest => match backend.latest_block_hash().await {
 				Ok(hash) => Some(BlockId::Hash(hash)),
 				Err(e) => {
-					log::warn!(target: "rpc", "Failed to get latest block hash from the sql db: {:?}", e);
+					log::warn!(target: "rpc", "Failed to get latest block hash from the sql db: {e:?}");
 					Some(BlockId::Hash(client.info().best_hash))
 				}
 			},
@@ -231,7 +233,7 @@ pub mod frontier_backend_client {
 		let substrate_hashes = backend
 			.block_hash(&hash)
 			.await
-			.map_err(|err| internal_err(format!("fetch aux store failed: {:?}", err)))?;
+			.map_err(|err| internal_err(format!("fetch aux store failed: {err:?}")))?;
 
 		if let Some(substrate_hashes) = substrate_hashes {
 			for substrate_hash in substrate_hashes {
@@ -269,7 +271,7 @@ pub mod frontier_backend_client {
 		let transaction_metadata = backend
 			.transaction_metadata(&transaction_hash)
 			.await
-			.map_err(|err| internal_err(format!("fetch aux store failed: {:?}", err)))?;
+			.map_err(|err| internal_err(format!("fetch aux store failed: {err:?}")))?;
 
 		transaction_metadata
 			.iter()
@@ -379,10 +381,13 @@ mod tests {
 		Ok(Arc::new(fc_db::kv::Backend::<Block, C>::new(
 			client,
 			&fc_db::kv::DatabaseSettings {
+				#[cfg(feature = "rocksdb")]
 				source: sc_client_db::DatabaseSource::RocksDb {
 					path,
 					cache_size: 0,
 				},
+				#[cfg(not(feature = "rocksdb"))]
+				source: sc_client_db::DatabaseSource::ParityDb { path },
 			},
 		)?))
 	}
@@ -434,7 +439,9 @@ mod tests {
 			ethereum_block_hash,
 			ethereum_transaction_hashes: vec![],
 		};
-		let _ = backend.mapping().write_hashes(commitment);
+		let _ = backend
+			.mapping()
+			.write_hashes(commitment, 2, fc_db::kv::NumberMappingWrite::Write);
 
 		// Expect B1 to be canon
 		assert_eq!(
@@ -466,7 +473,9 @@ mod tests {
 			ethereum_block_hash,
 			ethereum_transaction_hashes: vec![],
 		};
-		let _ = backend.mapping().write_hashes(commitment);
+		let _ = backend
+			.mapping()
+			.write_hashes(commitment, 2, fc_db::kv::NumberMappingWrite::Write);
 
 		// Still expect B1 to be canon
 		assert_eq!(

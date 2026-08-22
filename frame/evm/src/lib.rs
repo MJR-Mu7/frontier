@@ -54,6 +54,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(unused_crate_dependencies)]
 #![allow(clippy::too_many_arguments)]
+#![allow(clippy::useless_conversion)]
 
 extern crate alloc;
 
@@ -75,7 +76,7 @@ pub use evm::{
 };
 use hash_db::Hasher;
 use impl_trait_for_tuples::impl_for_tuples;
-use scale_codec::{Decode, Encode, MaxEncodedLen};
+use scale_codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use scale_info::TypeInfo;
 // Substrate
 use frame_support::{
@@ -106,7 +107,7 @@ pub use fp_evm::{
 	Account, AccountProvider, CallInfo, CreateInfo, ExecutionInfoV2 as ExecutionInfo,
 	FeeCalculator, IsPrecompileResult, LinearCostPrecompile, Log, Precompile, PrecompileFailure,
 	PrecompileHandle, PrecompileOutput, PrecompileResult, PrecompileSet,
-	TransactionValidationError, Vicinity,
+	TransactionValidationError, Vicinity, EVM_CONFIG,
 };
 
 pub use self::{
@@ -177,6 +178,11 @@ pub mod pallet {
 		/// The block gas limit. Can be a simple constant, or an adjustment algorithm in another pallet.
 		type BlockGasLimit: Get<U256>;
 
+		/// Optional maximum gas limit for a single transaction.
+		///
+		/// Set to `None` to rely only on the block gas limit and weight/proof-size constraints.
+		type TransactionGasLimit: Get<Option<U256>>;
+
 		/// EVM execution runner.
 		#[pallet::no_default]
 		type Runner: Runner<Self>;
@@ -209,7 +215,7 @@ pub mod pallet {
 
 		/// EVM config used in the module.
 		fn config() -> &'static EvmConfig {
-			&PECTRA_CONFIG
+			&EVM_CONFIG
 		}
 	}
 
@@ -234,6 +240,7 @@ pub mod pallet {
 
 		parameter_types! {
 			pub BlockGasLimit: U256 = U256::from(BLOCK_GAS_LIMIT);
+			pub TransactionGasLimit: Option<U256> = Some(fp_evm::MAX_TRANSACTION_GAS_LIMIT);
 			pub const ChainId: u64 = 42;
 			pub const GasLimitPovSizeRatio: u64 = BLOCK_GAS_LIMIT.saturating_div(MAX_POV_SIZE);
 			pub const GasLimitStorageGrowthRatio: u64 = BLOCK_GAS_LIMIT.saturating_div(MAX_STORAGE_GROWTH);
@@ -252,6 +259,7 @@ pub mod pallet {
 			type PrecompilesValue = ();
 			type ChainId = ChainId;
 			type BlockGasLimit = BlockGasLimit;
+			type TransactionGasLimit = TransactionGasLimit;
 			type OnChargeTransaction = ();
 			type OnCreate = ();
 			type FindAuthor = FindAuthorTruncated;
@@ -345,6 +353,7 @@ pub mod pallet {
 				authorization_list,
 				is_transactional,
 				validate,
+				None,
 				None,
 				None,
 				T::config(),
@@ -598,8 +607,8 @@ pub mod pallet {
 		InvalidNonce,
 		/// Gas limit is too low.
 		GasLimitTooLow,
-		/// Gas limit is too high.
-		GasLimitTooHigh,
+		/// Gas limit exceeds block gas limit.
+		GasLimitExceedsBlockLimit,
 		/// The chain id is invalid.
 		InvalidChainId,
 		/// the signature is invalid.
@@ -612,13 +621,17 @@ pub mod pallet {
 		Undefined,
 		/// Address not allowed to deploy contracts either via CREATE or CALL(CREATE).
 		CreateOriginNotAllowed,
+		/// EIP-7825: Transaction gas limit exceeds protocol cap (2^24).
+		TransactionGasLimitExceedsCap,
 	}
 
 	impl<T> From<TransactionValidationError> for Error<T> {
 		fn from(validation_error: TransactionValidationError) -> Self {
 			match validation_error {
 				TransactionValidationError::GasLimitTooLow => Error::<T>::GasLimitTooLow,
-				TransactionValidationError::GasLimitTooHigh => Error::<T>::GasLimitTooHigh,
+				TransactionValidationError::GasLimitExceedsBlockLimit => {
+					Error::<T>::GasLimitExceedsBlockLimit
+				}
 				TransactionValidationError::BalanceTooLow => Error::<T>::BalanceLow,
 				TransactionValidationError::TxNonceTooLow => Error::<T>::InvalidNonce,
 				TransactionValidationError::TxNonceTooHigh => Error::<T>::InvalidNonce,
@@ -629,6 +642,9 @@ pub mod pallet {
 				TransactionValidationError::InvalidSignature => Error::<T>::InvalidSignature,
 				TransactionValidationError::EmptyAuthorizationList => Error::<T>::Undefined,
 				TransactionValidationError::AuthorizationListTooLarge => Error::<T>::Undefined,
+				TransactionValidationError::TransactionGasLimitExceedsCap => {
+					Error::<T>::TransactionGasLimitExceedsCap
+				}
 				TransactionValidationError::UnknownError => Error::<T>::Undefined,
 			}
 		}
@@ -705,6 +721,7 @@ type NegativeImbalanceOf<C, T> = <C as Currency<AccountIdOf<T>>>::NegativeImbala
 	PartialEq,
 	Encode,
 	Decode,
+	DecodeWithMemTracking,
 	TypeInfo,
 	MaxEncodedLen
 )]
@@ -937,8 +954,6 @@ where
 	}
 }
 
-static PECTRA_CONFIG: EvmConfig = EvmConfig::pectra();
-
 impl<T: Config> Pallet<T> {
 	/// Check whether an account is empty.
 	pub fn is_account_empty(address: &H160) -> bool {
@@ -967,6 +982,12 @@ impl<T: Config> Pallet<T> {
 		<AccountCodes<T>>::remove(address);
 		<AccountCodesMetadata<T>>::remove(address);
 		let _ = <AccountStorages<T>>::clear_prefix(address, u32::MAX, None);
+	}
+
+	/// Remove an account's code if present.
+	pub fn remove_account_code(address: &H160) {
+		<AccountCodes<T>>::remove(address);
+		<AccountCodesMetadata<T>>::remove(address);
 	}
 
 	/// Create an account.

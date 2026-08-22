@@ -20,7 +20,7 @@ pub type ChainSpec = sc_service::GenericChainSpec;
 
 /// Generate a crypto pair from seed.
 pub fn get_from_seed<TPublic: Public>(seed: &str) -> <TPublic::Pair as Pair>::Public {
-	TPublic::Pair::from_string(&format!("//{}", seed), None)
+	TPublic::Pair::from_string(&format!("//{seed}"), None)
 		.expect("static values are valid; qed")
 		.public()
 }
@@ -47,6 +47,7 @@ fn properties() -> Properties {
 	let mut properties = Properties::new();
 	properties.insert("tokenDecimals".into(), 18.into());
 	properties.insert("ss58Format".into(), SS58Prefix::get().into());
+	properties.insert("isEthereum".into(), true.into());
 	properties
 }
 

@@ -23,7 +23,7 @@ use serde::Deserialize;
 // Substrate
 use sp_api::ProvideRuntimeApi;
 use sp_blockchain::HeaderBackend;
-use sp_runtime::traits::Block as BlockT;
+use sp_runtime::traits::{Block as BlockT, Header as HeaderT, UniqueSaturatedInto};
 // Frontier
 use fp_rpc::EthereumRuntimeRPCApi;
 
@@ -87,7 +87,7 @@ where
 							.client
 							.runtime_api()
 							.current_transaction_statuses(*substrate_block_hash)
-							.map_err(|e| format!("{:?}", e))?
+							.map_err(|e| format!("{e:?}"))?
 						{
 							statuses
 								.iter()
@@ -103,7 +103,22 @@ where
 							ethereum_transaction_hashes: existing_transaction_hashes,
 						};
 
-						self.backend.mapping().write_hashes(commitment)?;
+						// Get block number from header
+						let block_number: u64 = (*self
+							.client
+							.header(*substrate_block_hash)
+							.map_err(|e| format!("{e:?}"))?
+							.ok_or_else(|| {
+								format!("Header not found for block {substrate_block_hash:?}")
+							})?
+							.number())
+						.unique_saturated_into();
+
+						self.backend.mapping().write_hashes(
+							commitment,
+							block_number,
+							fc_db::kv::NumberMappingWrite::Write,
+						)?;
 					} else {
 						return Err(self.key_not_empty_error(key));
 					}
@@ -114,7 +129,7 @@ where
 				// Given ethereum block hash, get substrate block hash.
 				(Column::Block, MappingKey::EthBlockOrTransactionHash(ethereum_block_hash)) => {
 					let value = self.backend.mapping().block_hash(ethereum_block_hash)?;
-					println!("{:?}", value);
+					println!("{value:?}");
 				}
 				// Given ethereum transaction hash, get transaction metadata.
 				(
@@ -125,7 +140,7 @@ where
 						.backend
 						.mapping()
 						.transaction_metadata(ethereum_transaction_hash)?;
-					println!("{:?}", value);
+					println!("{value:?}");
 				}
 				_ => return Err(self.key_column_error(key, value)),
 			},
@@ -145,7 +160,7 @@ where
 							.client
 							.runtime_api()
 							.current_transaction_statuses(*substrate_block_hash)
-							.map_err(|e| format!("{:?}", e))?
+							.map_err(|e| format!("{e:?}"))?
 						{
 							statuses
 								.iter()
@@ -161,7 +176,22 @@ where
 							ethereum_transaction_hashes: existing_transaction_hashes,
 						};
 
-						self.backend.mapping().write_hashes(commitment)?;
+						// Get block number from header
+						let block_number: u64 = (*self
+							.client
+							.header(*substrate_block_hash)
+							.map_err(|e| format!("{e:?}"))?
+							.ok_or_else(|| {
+								format!("Header not found for block {substrate_block_hash:?}")
+							})?
+							.number())
+						.unique_saturated_into();
+
+						self.backend.mapping().write_hashes(
+							commitment,
+							block_number,
+							fc_db::kv::NumberMappingWrite::Write,
+						)?;
 					}
 				}
 				_ => return Err(self.key_value_error(key, value)),
